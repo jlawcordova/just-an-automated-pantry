@@ -4,14 +4,17 @@ on:
   push:
     branches:
       - main
-      - claude/pantry-inventory-mcp-oe3my7
+    paths-ignore:
+      - '**.md'
+  pull_request:
     paths-ignore:
       - '**.md'
   workflow_dispatch:
 
 concurrency:
-  group: fly-deploy
-  cancel-in-progress: false
+  # Deploys off main queue behind each other; PR verifications supersede themselves.
+  group: fly-deploy-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 env:
   FLY_APP: just-an-automated-pantry
@@ -37,6 +40,8 @@ jobs:
 
   deploy:
     needs: verify
+    # Fly only ever gets deployed from main; PR branches stop after verify.
+    if: github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
     # Reads FLY_API_TOKEN and GOOGLE_OAUTH_SECRET from the production environment.
     environment: production
