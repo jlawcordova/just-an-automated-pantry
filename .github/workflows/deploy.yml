@@ -1,0 +1,130 @@
+name: Deploy to Fly
+
+on:
+  push:
+    branches:
+      - main
+      - claude/pantry-inventory-mcp-oe3my7
+    paths-ignore:
+      - '**.md'
+  workflow_dispatch:
+
+concurrency:
+  group: fly-deploy
+  cancel-in-progress: false
+
+env:
+  FLY_APP: just-an-automated-pantry
+  FLY_REGION: sin
+  FLY_VOLUME: pantry_data
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - name: Typecheck
+        run: npm run typecheck
+      - name: Build
+        run: npm run build
+      - name: Smoke test
+        run: node --experimental-sqlite scripts/smoke-test.mjs
+
+  deploy:
+    needs: verify
+    runs-on: ubuntu-latest
+    # Reads FLY_API_TOKEN and GOOGLE_OAUTH_SECRET from the production environment.
+    environment: production
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: superfly/flyctl-actions/setup-flyctl@master
+
+      - name: Resolve Fly token
+        id: token
+        env:
+          # The token may have been stored under any of these names.
+          CANDIDATE: ${{ secrets.FLY_API_TOKEN || secrets.FLY_TOKEN || secrets.FLY_ACCESS_TOKEN }}
+        run: |
+          if [ -z "$CANDIDATE" ]; then
+            echo "::error::No Fly token found in the 'production' environment. Expected a secret named FLY_API_TOKEN (or FLY_TOKEN / FLY_ACCESS_TOKEN)."
+            exit 1
+          fi
+          echo "::add-mask::$CANDIDATE"
+          echo "value=$CANDIDATE" >> "$GITHUB_OUTPUT"
+
+      - name: Check Google client secret is present
+        run: |
+          if [ -z "${{ secrets.GOOGLE_OAUTH_SECRET }}" ]; then
+            echo "::error::GOOGLE_OAUTH_SECRET is not set in the 'production' environment."
+            exit 1
+          fi
+
+      - name: Create app if it does not exist
+        env:
+          FLY_API_TOKEN: ${{ steps.token.outputs.value }}
+        run: |
+          if flyctl status --app "$FLY_APP" >/dev/null 2>&1; then
+            echo "App $FLY_APP already exists."
+          else
+            echo "Creating app $FLY_APP..."
+            flyctl apps create "$FLY_APP" --org personal
+          fi
+
+      - name: Create volume if it does not exist
+        env:
+          FLY_API_TOKEN: ${{ steps.token.outputs.value }}
+        run: |
+          # SQLite needs durable storage; without this the pantry resets on every deploy.
+          existing=$(flyctl volumes list --app "$FLY_APP" --json 2>/dev/null || echo '[]')
+          if echo "$existing" | grep -q "\"name\": *\"$FLY_VOLUME\""; then
+            echo "Volume $FLY_VOLUME already exists."
+          else
+            echo "Creating volume $FLY_VOLUME..."
+            flyctl volumes create "$FLY_VOLUME" \
+              --app "$FLY_APP" --region "$FLY_REGION" --size 1 --yes
+          fi
+
+      - name: Stage runtime secrets
+        env:
+          FLY_API_TOKEN: ${{ steps.token.outputs.value }}
+          GOOGLE_OAUTH_SECRET: ${{ secrets.GOOGLE_OAUTH_SECRET }}
+          # Override by setting an ALLOWED_EMAILS variable on the production environment.
+          ALLOWED_EMAILS: ${{ vars.ALLOWED_EMAILS || 'hello@jlawcordova.com' }}
+        run: |
+          # --stage defers these to the deploy below, so the app rolls exactly once.
+          flyctl secrets set --stage --app "$FLY_APP" \
+            GOOGLE_OAUTH_SECRET="$GOOGLE_OAUTH_SECRET" \
+            ALLOWED_EMAILS="$ALLOWED_EMAILS"
+
+      - name: Deploy
+        env:
+          FLY_API_TOKEN: ${{ steps.token.outputs.value }}
+        run: flyctl deploy --remote-only --app "$FLY_APP"
+
+      - name: Verify the deployed app answers
+        env:
+          FLY_API_TOKEN: ${{ steps.token.outputs.value }}
+        run: |
+          base="https://$FLY_APP.fly.dev"
+          for attempt in $(seq 1 20); do
+            if curl -fsS "$base/healthz" >/dev/null 2>&1; then
+              echo "Health check passed."
+              echo "### Deployed" >> "$GITHUB_STEP_SUMMARY"
+              echo "" >> "$GITHUB_STEP_SUMMARY"
+              echo "- MCP endpoint: \`$base/mcp\`" >> "$GITHUB_STEP_SUMMARY"
+              echo "- Google redirect URI: \`$base/auth/google/callback\`" >> "$GITHUB_STEP_SUMMARY"
+              curl -fsS "$base/.well-known/oauth-protected-resource" | tee /dev/stderr >/dev/null
+              exit 0
+            fi
+            echo "Attempt $attempt: not ready yet, retrying in 5s..."
+            sleep 5
+          done
+          echo "::error::App did not become healthy at $base/healthz"
+          flyctl logs --app "$FLY_APP" --no-tail | tail -50
+          exit 1
