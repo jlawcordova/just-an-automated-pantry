@@ -100,8 +100,11 @@ If the OAuth consent screen is in *Testing*, add each allowlisted address as a t
 
 ### 3. Deploy
 
-Push to `main` or run the **Deploy to Fly** workflow manually. It typechecks, builds, runs the
-smoke test, then creates the app and volume if needed, stages the Fly secrets and deploys.
+Push to `main` or run the **Deploy to Fly** workflow manually from `main`. It typechecks, builds,
+runs the smoke test, then creates the app and volume if needed, stages the Fly secrets and deploys.
+
+Pull requests run the same typecheck, build and smoke test, but never deploy — Fly is only ever
+updated from `main`.
 
 ### 4. Add the connector to Claude
 
